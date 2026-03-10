@@ -2757,6 +2757,25 @@ impl Shell {
                 toplevel_leave_workspace(&surface, &workspace.handle);
                 self.remap_unfullscreened_window(surface, state, loop_handle);
             }
+
+            // Adjust geometry for XRandR emulation (games using smaller resolutions).
+            // Xwayland sets _XWAYLAND_RANDR_EMU_MONITOR_RECTS before the window maps;
+            // we need to re-configure the window at the emulated size so Xwayland can
+            // apply a viewport to scale it to fill the monitor.
+            if let Some(x11) = window.x11_surface() {
+                if let Ok(rects) = x11.xwayland_randr_emu_monitor_rects() {
+                    let output_geo = output.geometry();
+                    for (x, y, w, h) in rects {
+                        if x == output_geo.loc.x && y == output_geo.loc.y {
+                            let geo =
+                                Rectangle::new(output_geo.loc.as_logical(), Size::from((w, h)));
+                            let _ = x11.configure(geo);
+                            break;
+                        }
+                    }
+                }
+            }
+
             if was_activated {
                 workspace_state.add_workspace_state(&workspace_handle, WState::Urgent);
             }

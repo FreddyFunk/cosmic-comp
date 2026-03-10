@@ -16,6 +16,7 @@ use crate::{
     wayland::handlers::xdg_activation::ActivationContext,
 };
 use cosmic_comp_config::{EavesdroppingKeyboardMode, XwaylandDescaling};
+use smithay::output::Output;
 use smithay::{
     backend::{
         allocator::Fourcc,
@@ -53,7 +54,7 @@ use smithay::{
     },
     xwayland::{
         X11Surface, X11Wm, XWayland, XWaylandClientData, XWaylandEvent, XwmHandler,
-        xwm::{Reorder, XwmId},
+        xwm::{Reorder, WmWindowProperty, WmWindowType, XwmId},
     },
 };
 use tracing::{error, trace, warn};
@@ -769,6 +770,29 @@ impl Common {
     }
 }
 
+/// Read `_XWAYLAND_RANDR_EMU_MONITOR_RECTS` from an X11 window and return the
+/// emulated size for the given output, if any.
+///
+/// When a game uses XRandR to "change" the resolution, Xwayland sets this property
+/// with the emulated monitor geometry. The compositor should configure the fullscreen
+/// window at this emulated size so that Xwayland can apply a viewport to scale it up.
+fn xwayland_randr_emu_size_for_output(
+    window: &X11Surface,
+    output: &Output,
+) -> Option<Size<i32, Logical>> {
+    let rects = window.xwayland_randr_emu_monitor_rects().ok()?;
+    if rects.is_empty() {
+        return None;
+    }
+    let output_geo = output.geometry();
+    for (x, y, w, h) in rects {
+        if x == output_geo.loc.x && y == output_geo.loc.y {
+            return Some(Size::from((w, h)));
+        }
+    }
+    None
+}
+
 impl XwmHandler for State {
     fn xwm_state(&mut self, _xwm: XwmId) -> &mut X11Wm {
         self.common
@@ -814,11 +838,48 @@ impl XwmHandler for State {
             .find(|w| w.surface == window)
             .is_none()
         {
+            // Detect X11 windows that should be implicitly fullscreened.
+            // Some games (e.g. War Thunder) request fullscreen by creating a window
+            // at the monitor's resolution without setting _NET_WM_STATE_FULLSCREEN.
+            // Also check for XRandR emulation: the game may have used XRandR to set
+            // a smaller resolution, and Xwayland sets _XWAYLAND_RANDR_EMU_MONITOR_RECTS.
+            // In that case, the window is sized to the emulated resolution.
+            let fullscreen_output = if !window.is_override_redirect()
+                && !window.is_popup()
+                && matches!(window.window_type(), None | Some(WmWindowType::Normal))
+            {
+                let geo = window.geometry();
+                let emu_rects = window
+                    .xwayland_randr_emu_monitor_rects()
+                    .unwrap_or_default();
+
+                shell
+                    .outputs()
+                    .find(|output| {
+                        let output_size = output.geometry().size;
+
+                        // Case 1: Window sized to match the full output (native resolution)
+                        let matches_output =
+                            geo.size.w >= output_size.w && geo.size.h >= output_size.h;
+
+                        // Case 2: XRandR emulation — window sized to the emulated resolution
+                        let matches_emu = emu_rects.iter().any(|&(x, y, _w, _h)| {
+                            let output_loc = output.geometry().loc;
+                            x == output_loc.x && y == output_loc.y
+                        });
+
+                        matches_output || matches_emu
+                    })
+                    .cloned()
+            } else {
+                None
+            };
+
             let surface = CosmicSurface::from(window);
             shell.pending_windows.push(PendingWindow {
                 surface,
                 seat,
-                fullscreen: None,
+                fullscreen: fullscreen_output,
                 maximized: false,
             })
         }
@@ -1130,8 +1191,19 @@ impl XwmHandler for State {
             .and_then(|surface| shell.visible_output_for_surface(&surface).cloned())
             .unwrap_or_else(|| seat.focused_or_active_output());
 
+        // After fullscreen mapping, adjust geometry for XRandR emulation if needed.
+        // When a game uses XRandR to set a smaller resolution, Xwayland sets
+        // _XWAYLAND_RANDR_EMU_MONITOR_RECTS. We configure the window at the emulated
+        // size so Xwayland can apply a viewport to scale it to fill the monitor.
+        let emu_size = xwayland_randr_emu_size_for_output(&window, &output);
+
         match shell.fullscreen_request(&window, output.clone(), &self.common.event_loop_handle) {
             Some(target) => {
+                if let Some(emu_size) = emu_size {
+                    let mut geo = output.geometry().as_logical();
+                    geo.size = emu_size;
+                    let _ = window.configure(geo);
+                }
                 std::mem::drop(shell);
                 Shell::set_focus(self, Some(&target), &seat, None, true);
             }
@@ -1144,6 +1216,34 @@ impl XwmHandler for State {
                     pending.fullscreen = Some(output);
                 }
             }
+        }
+    }
+
+    fn property_notify(&mut self, _xwm: XwmId, window: X11Surface, property: WmWindowProperty) {
+        if !matches!(property, WmWindowProperty::XwaylandRandrEmuMonitorRects) {
+            return;
+        }
+
+        // If this window is currently fullscreen, reconfigure it with the emulated size.
+        if !window.is_fullscreen() {
+            return;
+        }
+
+        let shell = self.common.shell.read();
+        let output = window
+            .wl_surface()
+            .and_then(|surface| shell.visible_output_for_surface(&surface).cloned());
+        let Some(output) = output else {
+            return;
+        };
+
+        if let Some(emu_size) = xwayland_randr_emu_size_for_output(&window, &output) {
+            let mut geo = output.geometry().as_logical();
+            geo.size = emu_size;
+            let _ = window.configure(geo);
+        } else {
+            // Emulation removed, restore full output size
+            let _ = window.configure(output.geometry().as_logical());
         }
     }
 
