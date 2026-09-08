@@ -112,6 +112,7 @@ use smithay::{
         virtual_keyboard::VirtualKeyboardManagerState,
         xdg_activation::XdgActivationState,
         xdg_foreign::XdgForeignState,
+        xdg_toplevel_icon::XdgToplevelIconManager,
         xwayland_keyboard_grab::XWaylandKeyboardGrabState,
         xwayland_shell::XWaylandShellState,
     },
@@ -310,6 +311,7 @@ pub struct Common {
 
     // shell-related wayland state
     pub xdg_shell_state: XdgShellState,
+    pub xdg_toplevel_icon_manager: XdgToplevelIconManager,
     pub layer_shell_state: WlrLayerShellState,
     pub toplevel_info_state: ToplevelInfoState<State, CosmicSurface>,
     pub toplevel_management_state: ToplevelManagementState,
@@ -743,6 +745,8 @@ impl State {
                 WmCapabilities::WindowMenu,
             ],
         );
+        let mut xdg_toplevel_icon_manager = XdgToplevelIconManager::new::<State>(dh);
+        xdg_toplevel_icon_manager.add_icon_size(128);
         let xdg_activation_state = XdgActivationState::new::<State>(dh);
         let xdg_foreign_state = XdgForeignState::new::<State>(dh);
         let toplevel_info_state = ToplevelInfoState::new(dh, client_not_sandboxed);
@@ -816,6 +820,7 @@ impl State {
                 kde_decoration_state,
                 xdg_decoration_state,
                 xdg_shell_state,
+                xdg_toplevel_icon_manager,
                 layer_shell_state,
                 toplevel_info_state,
                 toplevel_management_state,

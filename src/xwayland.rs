@@ -55,12 +55,42 @@ use smithay::{
     },
     xwayland::{
         X11Surface, X11Wm, XWayland, XWaylandClientData, XWaylandEvent, XwmHandler,
-        xwm::{Reorder, XwmId},
+        xwm::{Reorder, WmWindowProperty, X11SurfaceIcon, XwmId},
     },
 };
 use tracing::{error, trace, warn};
 use xcursor::parser::Image;
 use xkbcommon::xkb::Keysym;
+
+use crate::wayland::protocols::toplevel_info::{WindowIcon, WindowIconState};
+
+fn select_net_wm_icon(icons: &[X11SurfaceIcon], preferred_size: u32) -> Option<WindowIcon> {
+    let icon = icons.iter().min_by_key(|icon| {
+        let edge = icon.width.max(icon.height);
+        (edge.abs_diff(preferred_size), std::cmp::Reverse(edge))
+    })?;
+    let pixels = icon
+        .pixels
+        .iter()
+        .flat_map(|pixel| {
+            [
+                (pixel >> 16) as u8,
+                (pixel >> 8) as u8,
+                *pixel as u8,
+                (pixel >> 24) as u8,
+            ]
+        })
+        .collect();
+
+    WindowIcon::from_rgba(icon.width, icon.height, pixels)
+}
+
+fn select_icon_update_target<T>(
+    registered: Option<T>,
+    shell_fallback: impl FnOnce() -> Option<T>,
+) -> Option<T> {
+    registered.or_else(shell_fallback)
+}
 
 #[derive(Debug)]
 pub struct XWaylandState {
@@ -783,11 +813,50 @@ impl XwmHandler for State {
     fn new_override_redirect_window(&mut self, _xwm: XwmId, _window: X11Surface) {}
     fn destroyed_window(&mut self, _xwm: XwmId, _window: X11Surface) {}
 
+    fn property_notify(&mut self, _xwm: XwmId, window: X11Surface, property: WmWindowProperty) {
+        if property != WmWindowProperty::Icon {
+            return;
+        }
+
+        let icon = select_net_wm_icon(&window.icons(), 128);
+        let registered = self
+            .common
+            .toplevel_info_state
+            .registered_toplevels()
+            .find(|surface| surface.x11_surface() == Some(&window))
+            .cloned();
+        let surface = select_icon_update_target(registered, || {
+            let shell = self.common.shell.read();
+            shell
+                .element_for_surface(&window)
+                .and_then(|mapped| {
+                    mapped.windows().find_map(|(surface, _)| {
+                        (surface.x11_surface() == Some(&window)).then_some(surface)
+                    })
+                })
+                .or_else(|| {
+                    shell
+                        .pending_windows
+                        .iter()
+                        .find(|pending| pending.surface.x11_surface() == Some(&window))
+                        .map(|pending| pending.surface.clone())
+                })
+        });
+
+        if let Some(surface) = surface {
+            surface
+                .user_data()
+                .get_or_insert(WindowIconState::default)
+                .set(icon);
+        }
+    }
+
     fn map_window_request(&mut self, _xwm: XwmId, window: X11Surface) {
         if let Err(err) = window.set_mapped(true) {
             warn!(?window, ?err, "Failed to send Xwayland Mapped-Event",);
         }
 
+        let icon = select_net_wm_icon(&window.icons(), 128);
         let mut shell = self.common.shell.write();
         let startup_id = window.startup_id();
         if shell.is_surface_mapped(&window) {
@@ -817,12 +886,21 @@ impl XwmHandler for State {
             .iter_mut()
             .find(|w| w.surface == window)
         {
+            pending
+                .surface
+                .user_data()
+                .get_or_insert(WindowIconState::default)
+                .set(icon);
             pending.seat = seat;
             pending.fullscreen = fullscreen;
             pending.minimized = minimized;
             pending.maximized = maximized;
         } else {
             let surface = CosmicSurface::from(window);
+            surface
+                .user_data()
+                .get_or_insert(WindowIconState::default)
+                .set(icon);
             shell.pending_windows.push(PendingWindow {
                 surface,
                 seat,

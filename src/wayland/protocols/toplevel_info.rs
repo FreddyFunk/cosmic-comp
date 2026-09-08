@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
-use std::{collections::HashSet, sync::Mutex};
+use std::{
+    collections::HashSet,
+    fs::File,
+    io::{self, Seek, Write},
+    os::fd::AsFd,
+    sync::{Arc, Mutex},
+};
 
 use smithay::{
     output::Output,
@@ -42,7 +48,111 @@ pub trait Window: IsAlive + Clone + PartialEq + Send {
     fn is_sticky(&self) -> bool;
     fn is_resizing(&self) -> bool;
     fn global_geometry(&self) -> Option<Rectangle<i32, Global>>;
+    fn icon(&self) -> Option<WindowIcon>;
+    fn pid(&self, dh: &DisplayHandle) -> Option<u32>;
     fn user_data(&self) -> &UserDataMap;
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WindowIcon {
+    Name(String),
+    Rgba {
+        width: u32,
+        height: u32,
+        pixels: Arc<[u8]>,
+    },
+}
+
+impl WindowIcon {
+    pub fn from_rgba(width: u32, height: u32, pixels: Vec<u8>) -> Option<Self> {
+        const MAX_DIMENSION: u32 = 512;
+        const MAX_SOURCE_PIXELS: usize = 4 * 1024 * 1024;
+
+        let pixel_count = usize::try_from(width)
+            .ok()?
+            .checked_mul(usize::try_from(height).ok()?)?;
+        if width == 0
+            || height == 0
+            || pixel_count > MAX_SOURCE_PIXELS
+            || pixels.len() != pixel_count.checked_mul(4)?
+        {
+            return None;
+        }
+
+        if width <= MAX_DIMENSION && height <= MAX_DIMENSION {
+            return Some(Self::Rgba {
+                width,
+                height,
+                pixels: pixels.into(),
+            });
+        }
+
+        let max_dimension = width.max(height);
+        let scaled_width = ((u64::from(width) * u64::from(MAX_DIMENSION)
+            + u64::from(max_dimension) / 2)
+            / u64::from(max_dimension))
+        .max(1) as u32;
+        let scaled_height = ((u64::from(height) * u64::from(MAX_DIMENSION)
+            + u64::from(max_dimension) / 2)
+            / u64::from(max_dimension))
+        .max(1) as u32;
+        let image = image::RgbaImage::from_raw(width, height, pixels)?;
+        let pixels = image::imageops::resize(
+            &image,
+            scaled_width,
+            scaled_height,
+            image::imageops::FilterType::Triangle,
+        )
+        .into_raw();
+        Some(Self::Rgba {
+            width: scaled_width,
+            height: scaled_height,
+            pixels: pixels.into(),
+        })
+    }
+}
+
+#[derive(Default)]
+pub struct WindowIconState(Mutex<Option<WindowIcon>>);
+
+impl WindowIconState {
+    pub fn get(&self) -> Option<WindowIcon> {
+        self.0.lock().unwrap().clone()
+    }
+
+    pub fn set(&self, icon: Option<WindowIcon>) {
+        *self.0.lock().unwrap() = icon;
+    }
+}
+
+fn write_icon_file(icon: &WindowIcon) -> io::Result<(File, u32, u32)> {
+    let WindowIcon::Rgba {
+        width,
+        height,
+        pixels,
+    } = icon
+    else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "named icons have no pixel payload",
+        ));
+    };
+
+    let fd = rustix::fs::memfd_create(
+        c"cosmic-toplevel-icon",
+        rustix::fs::MemfdFlags::ALLOW_SEALING | rustix::fs::MemfdFlags::CLOEXEC,
+    )?;
+    let mut file = File::from(fd);
+    file.write_all(pixels)?;
+    file.rewind()?;
+    rustix::fs::fcntl_add_seals(
+        file.as_fd(),
+        rustix::fs::SealFlags::GROW
+            | rustix::fs::SealFlags::SHRINK
+            | rustix::fs::SealFlags::WRITE
+            | rustix::fs::SealFlags::SEAL,
+    )?;
+    Ok((file, *width, *height))
 }
 
 #[derive(Debug)]
@@ -102,6 +212,8 @@ pub struct ToplevelHandleStateInner<W: Window> {
     title: String,
     app_id: String,
     states: Option<Vec<States>>,
+    icon: Option<Option<WindowIcon>>,
+    pid: Option<Option<u32>>,
     pub(super) window: Option<W>,
 }
 pub type ToplevelHandleState<W> = Mutex<ToplevelHandleStateInner<W>>;
@@ -116,6 +228,8 @@ impl<W: Window> ToplevelHandleStateInner<W> {
             title: String::new(),
             app_id: String::new(),
             states: None,
+            icon: None,
+            pid: None,
             window: Some(window.clone()),
         })
     }
@@ -129,6 +243,8 @@ impl<W: Window> ToplevelHandleStateInner<W> {
             title: String::new(),
             app_id: String::new(),
             states: None,
+            icon: None,
+            pid: None,
             window: None,
         })
     }
@@ -318,7 +434,7 @@ where
         F: for<'a> Fn(&'a Client) -> bool + Send + Sync + Clone + 'static,
     {
         let global = dh.create_global::<D, ZcosmicToplevelInfoV1, _>(
-            3,
+            4,
             ToplevelInfoGlobalData {
                 filter: Box::new(client_filter.clone()),
             },
@@ -531,6 +647,17 @@ where
         None
     };
 
+    let new_icon = (instance.version() >= zcosmic_toplevel_handle_v1::EVT_ICON_SINCE
+        && handle_state
+            .icon
+            .as_ref()
+            .is_none_or(|icon| icon != &window.icon()))
+    .then(|| window.icon());
+    let pid = window.pid(dh);
+    let new_pid = (instance.version() >= zcosmic_toplevel_handle_v1::EVT_PID_SINCE
+        && handle_state.pid.is_none_or(|current| current != pid))
+    .then_some(pid);
+
     let geometry_changed = if !window.is_resizing() {
         let geometry = window.global_geometry();
         if handle_state.geometry != geometry {
@@ -551,6 +678,8 @@ where
     if new_title.is_none()
         && new_app_id.is_none()
         && new_states.is_none()
+        && new_icon.is_none()
+        && new_pid.is_none()
         && !geometry_changed
         && !outputs_changed
         && !workspaces_changed
@@ -589,6 +718,39 @@ where
             .flat_map(|state| (*state as u32).to_ne_bytes())
             .collect::<Vec<u8>>();
         instance.state(states);
+        changed = true;
+    }
+
+    if let Some(icon) = new_icon {
+        let sent = match &icon {
+            Some(WindowIcon::Name(name)) => {
+                instance.icon_name(name.clone());
+                true
+            }
+            Some(icon @ WindowIcon::Rgba { .. }) => match write_icon_file(icon) {
+                Ok((file, width, height)) => {
+                    instance.icon(file.as_fd(), width, height);
+                    true
+                }
+                Err(err) => {
+                    error!(?err, "Failed to create toplevel icon payload");
+                    false
+                }
+            },
+            None => {
+                instance.icon_removed();
+                true
+            }
+        };
+        if sent {
+            handle_state.icon = Some(icon);
+            changed = true;
+        }
+    }
+
+    if let Some(pid) = new_pid {
+        instance.pid(pid.unwrap_or(0));
+        handle_state.pid = Some(pid);
         changed = true;
     }
 
